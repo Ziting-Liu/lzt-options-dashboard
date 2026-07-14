@@ -98,8 +98,8 @@ st.title(f"{info.get('shortName', ticker)} ({ticker})")
 
 tabs = st.tabs([
     "Overview", "Valuation", "Growth", "Profitability",
-    "Financial Strength", "Technicals", "Historical Performance",
-    "Quality Score", "Journal",
+    "Financial Strength", "Technicals", "Options Dashboard",
+    "Historical Performance", "Quality Score", "Journal",
 ])
 
 # ============================================================
@@ -211,7 +211,12 @@ with tabs[3]:
     net_margin = info.get("profitMargins")
     equity = get_row(balance, ["Stockholders Equity", "Total Stockholder Equity"])
     total_debt_row = get_row(balance, ["Total Debt"])
-    cash_row = get_row(balance, ["Cash And Cash Equivalents", "Cash"])
+    cash_row = get_row(balance, [
+        "Cash Cash Equivalents And Short Term Investments",
+        "Cash And Cash Equivalents And Short Term Investments",
+        "Cash And Cash Equivalents",
+        "Cash",
+    ])
 
     roe = info.get("returnOnEquity")
     roa = info.get("returnOnAssets")
@@ -323,9 +328,110 @@ with tabs[5]:
     c9.markdown(f"**Today's Volume vs Avg**<br>{signed_pct_html((today_vol / avg_vol - 1) if avg_vol else None)}", unsafe_allow_html=True)
 
 # ============================================================
-# 7. HISTORICAL PERFORMANCE
+# 7. OPTIONS DASHBOARD (highest priority — conservative, long-term framing)
 # ============================================================
 with tabs[6]:
+    st.caption(
+        "Conservative strike selection for long-term investors: targets a low, deliberate "
+        "probability of assignment (~20% delta) rather than maximizing premium collected. "
+        "Estimates are simplified Black-Scholes, not live market pricing — treat as planning "
+        "guidance, not an execution price."
+    )
+
+    expirations = df_.get_option_expirations(ticker)
+    if not expirations:
+        st.warning(f"No options chain available for {ticker} on Yahoo Finance.")
+    else:
+        dtes = [(pd.to_datetime(e).date() - datetime.today().date()).days for e in expirations]
+        target_dte = calc.pick_expiration_near_target(dtes, calc.TARGET_DTE_DAYS)
+        target_expiration = expirations[dtes.index(target_dte)]
+
+        calls_df, puts_df = df_.get_option_chain(ticker, target_expiration)
+
+        if calls_df.empty and puts_df.empty:
+            st.warning("Options chain returned no data for this expiration. Try again shortly.")
+        else:
+            atm_iv = calc.find_atm_iv(calls_df, puts_df, current_price)
+            hv_30_opt = calc.historical_volatility(close, 30)
+            iv_hv_ratio = calc.safe_ratio(atm_iv, hv_30_opt)
+            exp_move = calc.expected_move(current_price, atm_iv, target_dte)
+
+            # Log today's ATM IV snapshot so real IV Rank/Percentile builds up over time.
+            storage.log_iv_snapshot(ticker, atm_iv)
+            iv_history_rows = storage.get_iv_history(ticker)
+            iv_history_values = [row[1] for row in iv_history_rows]
+
+            if len(iv_history_values) >= 20:
+                iv_rank, iv_percentile = calc.iv_rank_and_percentile(atm_iv, iv_history_values[:-1])
+                iv_source_note = f"Based on {len(iv_history_values)} days of logged IV history for {ticker}."
+            else:
+                iv_rank, iv_percentile = calc.iv_rank_proxy_from_hv(close, atm_iv)
+                iv_source_note = (
+                    f"⚠️ Approximated using historical volatility (only {len(iv_history_values)}/20 days of real IV "
+                    "history collected so far — check back daily and this will switch to true IV Rank automatically)."
+                )
+
+            st.markdown(f"**Expiration used for suggestions: {target_expiration} ({target_dte} DTE)**")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("ATM Implied Volatility", fmt_pct(atm_iv))
+            c2.metric("30-Day Historical Volatility", fmt_pct(hv_30_opt))
+            c3.metric("IV / HV Ratio", f"{iv_hv_ratio:.2f}" if iv_hv_ratio else "N/A")
+
+            c4, c5, c6 = st.columns(3)
+            c4.metric("IV Rank", f"{iv_rank:.0f}" if iv_rank is not None else "N/A")
+            c5.metric("IV Percentile", f"{iv_percentile:.0f}th" if iv_percentile is not None else "N/A")
+            c6.metric("Expected Move (by expiration)", fmt_money(exp_move) if exp_move else "N/A")
+            st.caption(iv_source_note)
+
+            st.markdown("---")
+            st.markdown("### Suggested Positions")
+
+            csp = calc.pick_conservative_strike(puts_df, current_price, target_dte, option_type="put")
+            cc = calc.pick_conservative_strike(calls_df, current_price, target_dte, option_type="call")
+
+            col_csp, col_cc = st.columns(2)
+            with col_csp:
+                st.markdown("#### 🛡️ Cash Secured Put")
+                if csp:
+                    premium = calc.estimate_premium(csp)
+                    ann_yield = calc.annualized_yield(premium, csp["strike"], target_dte)
+                    prob_assignment = abs(csp["delta"]) * 100
+                    st.metric("Suggested Strike", fmt_money(csp["strike"]))
+                    st.metric("Suggested Delta", f"{csp['delta']:.2f}")
+                    st.metric("Suggested DTE", f"{target_dte} days")
+                    st.metric("Est. Premium (mid)", fmt_money(premium) if premium else "N/A")
+                    st.metric("Estimated Annualized Yield", fmt_pct(ann_yield) if ann_yield else "N/A")
+                    st.metric("Probability of Assignment", f"{prob_assignment:.0f}%")
+                    st.metric("Probability OTM (expires worthless)", f"{100 - prob_assignment:.0f}%")
+                else:
+                    st.info("No suitable conservative put strike found in this chain.")
+
+            with col_cc:
+                st.markdown("#### 📈 Covered Call")
+                if cc:
+                    premium = calc.estimate_premium(cc)
+                    ann_yield = calc.annualized_yield(premium, current_price, target_dte)
+                    prob_assignment = cc["delta"] * 100
+                    st.metric("Suggested Strike", fmt_money(cc["strike"]))
+                    st.metric("Suggested Delta", f"{cc['delta']:.2f}")
+                    st.metric("Suggested DTE", f"{target_dte} days")
+                    st.metric("Est. Premium (mid)", fmt_money(premium) if premium else "N/A")
+                    st.metric("Estimated Annualized Yield", fmt_pct(ann_yield) if ann_yield else "N/A")
+                    st.metric("Probability of Assignment", f"{prob_assignment:.0f}%")
+                    st.metric("Probability OTM (expires worthless)", f"{100 - prob_assignment:.0f}%")
+                else:
+                    st.info("No suitable conservative call strike found in this chain.")
+
+            st.caption(
+                f"Targets ~20% delta ({calc.TARGET_DELTA_CSP} for puts / {calc.TARGET_DELTA_CC} for calls) — "
+                "a deliberately conservative, low-assignment-probability selection, not the richest premium available."
+            )
+
+# ============================================================
+# 8. HISTORICAL PERFORMANCE
+# ============================================================
+with tabs[7]:
     cagr_10y = calc.cagr(close, 10)
     cagr_20y = calc.cagr(close, 20)
     mdd = calc.max_drawdown(close)
@@ -353,9 +459,9 @@ with tabs[6]:
     c9.metric("30-Day Historical Volatility", fmt_pct(hv_30))
 
 # ============================================================
-# 8. BUSINESS QUALITY SCORE
+# 9. BUSINESS QUALITY SCORE
 # ============================================================
-with tabs[7]:
+with tabs[8]:
     metrics = {
         "roic": roic,
         "gross_margin": gross_margin,
@@ -369,13 +475,20 @@ with tabs[7]:
         "interest_coverage": interest_coverage,
         "historical_volatility_30d": hv_30,
     }
-    category_scores, overall = calc.compute_quality_scores(metrics)
+    category_scores, overall = calc.compute_quality_scores(metrics, sector=info.get("sector"))
 
     for category, score in category_scores.items():
         st.markdown(f"**{category}**  {calc.score_to_stars(score)}  ({score if score is not None else 'N/A'} / 5)")
 
     st.markdown("---")
     st.markdown(f"### Overall Score: {overall if overall is not None else 'N/A'} / 10")
+    sector_note = (
+        f"Thresholds adjusted for **{info.get('sector')}** as a capital-intensive sector "
+        "(more debt / thinner margins expected and scored accordingly)."
+        if info.get("sector") in calc.CAPITAL_INTENSIVE_SECTORS
+        else f"Sector: **{info.get('sector', 'N/A')}** — standard thresholds applied."
+    )
+    st.caption(sector_note)
     st.caption(
         "Rule-based scoring, not AI-generated. Thresholds favor durable, moderately-valued, "
         "financially strong businesses over high-growth/high-volatility names — tune the "
@@ -383,9 +496,9 @@ with tabs[7]:
     )
 
 # ============================================================
-# 9. INVESTMENT JOURNAL
+# 10. INVESTMENT JOURNAL
 # ============================================================
-with tabs[8]:
+with tabs[9]:
     st.caption(
         "⚠️ Saved locally to a SQLite file. On Streamlit Community Cloud this can be wiped on "
         "redeploy — export a backup after adding notes, and re-import if you ever redeploy fresh."
