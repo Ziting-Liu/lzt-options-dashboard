@@ -84,6 +84,24 @@ def get_earnings_calendar(ticker: str):
         return None
 
 
+@st.cache_data(ttl=900)  # 15 min — options quotes move faster than fundamentals
+def get_option_expirations(ticker: str) -> tuple:
+    try:
+        return tuple(yf.Ticker(ticker).options)
+    except Exception:
+        return tuple()
+
+
+@st.cache_data(ttl=900)
+def get_option_chain(ticker: str, expiration: str):
+    """Returns (calls_df, puts_df) for a given expiration date string (e.g. '2026-08-21')."""
+    try:
+        chain = yf.Ticker(ticker).option_chain(expiration)
+        return chain.calls, chain.puts
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+
 def days_until(date_value):
     if date_value is None:
         return None
