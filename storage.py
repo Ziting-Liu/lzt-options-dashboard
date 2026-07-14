@@ -57,7 +57,45 @@ def _get_conn():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS iv_history (
+            ticker TEXT,
+            snapshot_date TEXT,
+            atm_iv REAL,
+            PRIMARY KEY (ticker, snapshot_date)
+        )
+        """
+    )
     return conn
+
+
+def log_iv_snapshot(ticker: str, atm_iv: float):
+    """Records today's ATM IV for this ticker (one row per ticker per day).
+    Building this up over time is what lets IV Rank/Percentile become a real
+    calculation instead of the historical-volatility-based approximation."""
+    if atm_iv is None:
+        return
+    conn = _get_conn()
+    today = datetime.now(timezone.utc).date().isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO iv_history (ticker, snapshot_date, atm_iv) VALUES (?, ?, ?)",
+        (ticker.upper(), today, float(atm_iv)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_iv_history(ticker: str):
+    """Returns a list of (date_str, atm_iv) tuples, oldest first."""
+    conn = _get_conn()
+    cur = conn.execute(
+        "SELECT snapshot_date, atm_iv FROM iv_history WHERE ticker = ? ORDER BY snapshot_date ASC",
+        (ticker.upper(),),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 def save_entry(ticker: str, values: dict):
